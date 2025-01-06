@@ -1,0 +1,52 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Source Account Setup for EventBridge Rule to Detect Security Service Disabling
+
+Parameters:
+  CentralAccountID:
+    Description: The AWS Account ID of the central monitoring account
+    Type: String
+
+  CentralAccountRegion:
+    Description: The AWS Region of the central monitoring account
+    Type: String
+    Default: us-east-1
+
+Resources:
+  # EventBridge Rule for Security Services
+  SecurityServiceDisableRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: DetectSecurityServiceDisable
+      EventBusName: default
+      EventPattern:
+        source:
+          - aws.securityhub
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventName:
+            - DisableSecurityHub
+      Targets:
+        - Id: CentralEventBusTarget
+          Arn: !Sub arn:aws:events:${CentralAccountRegion}:${CentralAccountID}:event-bus/CentralMonitoringBus
+          RoleArn: !GetAtt PublishToCentralEventBusRole.Arn
+
+  # IAM Role for Publishing Events to Central Event Bus
+  PublishToCentralEventBusRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PublishToCentralEventBusPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Sub arn:aws:events:${CentralAccountRegion}:${CentralAccountID}:event-bus/CentralMonitoringBus

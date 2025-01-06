@@ -1,0 +1,150 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Central Monitoring Account Setup for Cross-Account EventBridge Integration
+
+Parameters:
+  SourceAccountID:
+    Description: The AWS Account ID of the source account
+    Type: String
+
+Resources:
+  CustomEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: CentralMonitoringBus
+  EventBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Properties:
+      EventBusName: !Ref CustomEventBus
+      StatementId: AllowSourceAccountPutEvents
+      Action: events:PutEvents
+      Principal: !Ref SourceAccountID
+
+  SecurityEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: SecurityServiceDisabledRule
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source:
+          - aws.securityhub
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventName:
+            - DisableSecurityHub
+      Targets:
+        - Id: LambdaTarget
+          Arn: !GetAtt EventProcessorLambda.Arn
+
+  # IAM Role for EventBridge to Invoke Lambda
+  EventBridgeInvokeLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EventBridgeInvokeLambdaPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt EventProcessorLambda.Arn
+
+  # Lambda Function to Process Events
+  EventProcessorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ProcessSecurityEvents
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SecurityAlertsSSMParameter
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          sns_client = boto3.client('sns')
+          sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+
+          def lambda_handler(event, context):
+              logger.info("Received Event: %s", json.dumps(event))
+              try:
+                  message = {
+                      "account": event['account'],
+                      "time": event['time'],
+                      "service": event['source'],
+                      "eventname": event['detail']['eventName']
+                  }
+                  sns_client.publish(
+                      TopicArn=sns_topic_arn,
+                      Message=json.dumps(message),
+                      Subject='Security Service Disabled Alert'
+                  )
+                  logger.info("Message sent to SNS topic successfully.")
+              except Exception as e:
+                  logger.error("Error processing event: %s", str(e))
+              return {"statusCode": 200, "body": "Event Processed"}
+
+  # IAM Role for Lambda Execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - sns:Publish
+                Resource: "*"
+
+  # SNS Topic for Notifications
+  SecurityAlertsSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: SecurityAlerts
+
+    # Lambda Permission for EventBridge to Invoke Lambda
+  LambdaPermissionForEventBridge:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EventProcessorLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecurityEventRule.Arn
+    
+
+  # SSM Parameter to Store SNS Topic ARN
+  SecurityAlertsSSMParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /central/monitoring/security-alerts-sns
+      Type: String
+      Value: !Ref SecurityAlertsSNSTopic
+      Description: ARN of the SNS topic for security alerts
